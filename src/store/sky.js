@@ -30,6 +30,10 @@ export const useSkyStore = defineStore('sky', {
     seasons: s => s.state?.seasons || [],
     // 赛事保险：方案目录 / 当季保单 / 本季事故理赔单（含未报案）/ 事故统计
     insurance: s => s.state?.insurance || { plans: [], policy: null, incidents: [], stats: { incidents: 0, payouts: 0 }, canInsure: false },
+    // 事故维修工单（定损→开工单→完工→验收；新单在前）
+    repairs: s => s.state?.repairs || [],
+    // 未验收结案的工单（维修中/待验收）：自有艇停场检修，禁止参赛、常规维护关闭
+    pendingRepair: s => (s.state?.repairs || []).find(r => r.status === 'repairing' || r.status === 'repaired') || null,
     // 当前赛季 6 站是否已全部完赛（尚未衔接新赛季）
     seasonComplete: s => !!s.state?.seasonComplete
   },
@@ -67,6 +71,10 @@ export const useSkyStore = defineStore('sky', {
     async reportIncident(raceId) { const r = await post(`/api/incidents/${raceId}/report`); await this.refresh(); if (!r.ok) this.tip(r.msg); return r },
     async assessIncident(id) { const r = await post(`/api/incidents/${id}/assess`); await this.refresh(); if (!r.ok) this.tip(r.msg); return r },
     async payoutIncident(id) { const r = await post(`/api/incidents/${id}/payout`); await this.refresh(); if (!r.ok) this.tip(r.msg); return r },
+    // 事故维修工单：开工单（可指定技工 id，省略 = 自动·最强技工）→ 技工完工 → 经理验收；每步服务端状态机幂等
+    async openRepair(id, mechanicId) { const r = await post(`/api/incidents/${id}/repair`, mechanicId ? { mechanicId } : {}); await this.refresh(); if (!r.ok) this.tip(r.msg); return r },
+    async completeRepair(id) { const r = await post(`/api/repairs/${id}/complete`); await this.refresh(); if (!r.ok) this.tip(r.msg); return r },
+    async acceptRepair(id) { const r = await post(`/api/repairs/${id}/accept`); await this.refresh(); if (!r.ok) this.tip(r.msg); return r },
     async reset() { await post('/api/reset'); await this.init() }
   }
 })

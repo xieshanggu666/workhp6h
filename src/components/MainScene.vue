@@ -33,6 +33,9 @@ const lineupTxt = computed(() => {
   const m = r.mech ? r.mech.name + (r.mech.auto ? '·自动' : '') : '无技工'
   return `${p} / ${m} / ${r.ship?.name || '自有艇'}`
 })
+// 自有艇停场警示：有未验收结案的事故维修工单且下一站以自有艇出赛时，开赛将被服务端拦截
+const repairBlock = computed(() =>
+  store.pendingRepair && store.lineup?.resolved?.ship?.kind !== 'rental' ? store.pendingRepair : null)
 
 const starting = ref(false)
 // 6 站全部完赛（尚未衔接）：航线终点弹出完季浮条，衔接新赛季而不是停在终点
@@ -189,6 +192,9 @@ function resume() { if (active.value) emit('view', active.value, 'live') }
       <div class="ph-bar"><i :style="{ width: (done / total * 100) + '%' }"></i></div>
       <div class="ph-nums mono">{{ done }} / {{ total }} 站完赛</div>
       <div v-if="lineupTxt" class="ph-lineup" title="机库「赛事排班」中可调整下一站出赛阵容">🗓️ {{ lineupTxt }}</div>
+      <div v-if="repairBlock" class="ph-repair" title="事故维修工单未验收结案，自有艇停场检修">
+        🛠️ 工单 #{{ repairBlock.id }} {{ repairBlock.status === 'repaired' ? '待验收' : '维修中' }} · 自有艇验收前禁止参赛
+      </div>
     </div>
   </div>
 </template>

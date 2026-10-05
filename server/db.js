@@ -180,6 +180,25 @@ CREATE TABLE IF NOT EXISTS incidents (
   paid_at TEXT,
   rejected_at TEXT
 );
+-- 事故维修工单：定损后由经理开具（指派技工、预付维修费=定损额），技工完工恢复部件健康，
+-- 经理验收结案；未验收结案的工单让自有艇停场检修（禁止参赛、常规维护关闭）。
+-- 一案一单（incident_id 唯一）；仅自有艇事故开工单——租约艇由出租方整备，损伤以磨损费口径已由保险对冲。
+-- status: repairing 维修中 | repaired 待验收 | done 已验收结案 | void 随越站作废（退费并扣回已恢复部件）
+CREATE TABLE IF NOT EXISTS repairs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL UNIQUE,  -- 一起事故至多一张工单
+  season INTEGER NOT NULL,              -- 事故所属赛季（跨赛季仍可完工验收）
+  level TEXT NOT NULL,
+  damage INTEGER NOT NULL DEFAULT 0,    -- 事故损伤快照（点数）
+  cost INTEGER NOT NULL DEFAULT 0,      -- 维修费用（= 定损额，服务端核定，开工单即预付）
+  restored INTEGER NOT NULL DEFAULT 0,  -- 完工实际恢复的部件健康（损伤 + 技工加成，越站冲回依据）
+  mechanic_id INTEGER,                  -- 指派技工（快照，离队不影响工单）
+  mechanic_name TEXT,
+  status TEXT NOT NULL DEFAULT 'repairing',
+  created_at TEXT,
+  repaired_at TEXT,
+  accepted_at TEXT
+);
 -- 比赛记录：动画 / 实时排名 / 最终奖励共用的唯一事实来源
 -- status=running 未完赛（可中断续看）；settled=1 已结算（奖励只发一次，可历史回放）
 CREATE TABLE IF NOT EXISTS races (

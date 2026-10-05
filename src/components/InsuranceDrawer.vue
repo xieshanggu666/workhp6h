@@ -56,6 +56,37 @@ async function payout(it) {
     else store.tip(`保险赔付 ¥${r.payout} 已到账`)
   }
 }
+
+/* ---------- 事故维修工单：经理开工单（指派技工）→ 技工完工 → 经理验收 ---------- */
+const mechanics = computed(() => store.state?.mechanics || [])
+// 每张事故卡片独立选择指派技工（缺省 = 自动·最强技工）
+const mechPick = ref({})
+const busyRepair = ref(0)
+async function openRepair(it) {
+  busyRepair.value = it.id
+  const pick = mechPick.value[it.raceId]
+  const r = await store.openRepair(it.id, pick === '' || pick == null ? null : Number(pick))
+  if (r?.ok) store.tip(r.already ? '该事故已开工单' : `维修工单已开具，预付维修费 ¥${r.repair.cost}`)
+  busyRepair.value = 0
+}
+async function completeRepair(rp) {
+  busyRepair.value = rp.id
+  const r = await store.completeRepair(rp.id)
+  if (r?.ok) store.tip(r.already ? '工单已完工' : `技工完工：部件健康恢复 +${r.restored}，待经理验收`)
+  busyRepair.value = 0
+}
+async function acceptRepair(rp) {
+  busyRepair.value = rp.id
+  const r = await store.acceptRepair(rp.id)
+  if (r?.ok) store.tip(r.already ? '工单已验收结案' : '验收通过，工单结案——自有艇恢复参赛资格')
+  busyRepair.value = 0
+}
+const REPAIR_STATUS = {
+  repairing: { text: '🔧 维修中', cls: 'o' },
+  repaired: { text: '🧪 待验收', cls: 'b' },
+  done: { text: '✔ 已验收结案', cls: 'm' },
+  void: { text: '已作废', cls: 'gray' }
+}
 </script>
 
 <template>
@@ -179,8 +210,51 @@ async function payout(it) {
                 <button v-if="it.status === 'assessed'" class="btn sm"
                   :class="it.elig?.canPayout ? 'mint' : 'ghost'"
                   :disabled="busyId === it.id || !it.elig?.canPayout" @click="payout(it)">💰 申请赔付</button>
-                <span v-if="it.status === 'paid'" class="cl-done">赔款已到账，可在机库维修恢复部件</span>
+                <span v-if="it.status === 'paid'" class="cl-done">赔款已到账，可用于冲抵工单维修费</span>
                 <span v-if="it.status === 'rejected'" class="cl-done dim">未在赛季结束前完成赔付，保险责任终止</span>
+              </div>
+
+              <!-- 事故维修工单：经理开工单（预付维修费=定损额）→ 技工完工恢复部件 → 经理验收结案；
+                   未验收结案前自有艇停场检修、禁止参赛 -->
+              <div v-if="it.repair" class="rp-box">
+                <div class="rp-head">
+                  <b>🧾 维修工单 #{{ it.repair.id }}</b>
+                  <span class="tag" :class="REPAIR_STATUS[it.repair.status]?.cls">{{ REPAIR_STATUS[it.repair.status]?.text || it.repair.status }}</span>
+                </div>
+                <div class="cl-rows">
+                  <div class="rent-row"><span>指派技工</span><b>🔧 {{ it.repair.mechanic?.name || '—' }}</b></div>
+                  <div class="rent-row"><span>维修费（开工单预付）</span><b class="mono">¥{{ it.repair.cost.toLocaleString() }}</b></div>
+                  <div v-if="it.payout" class="rent-row">
+                    <span>保险赔付对冲 · 实际自付</span>
+                    <b class="mono" style="color:var(--gold2)">¥{{ Math.max(0, it.repair.cost - it.payout).toLocaleString() }}</b>
+                  </div>
+                  <div v-if="it.repair.restored" class="rent-row">
+                    <span>已恢复部件健康</span><b class="mono" style="color:var(--mint)">+{{ it.repair.restored }}</b>
+                  </div>
+                </div>
+                <div class="cl-actions">
+                  <button v-if="it.repair.status === 'repairing'" class="btn sm primary"
+                    :disabled="busyRepair === it.repair.id" @click="completeRepair(it.repair)">⚒️ 技工完工</button>
+                  <button v-if="it.repair.status === 'repaired'" class="btn sm mint"
+                    :disabled="busyRepair === it.repair.id" @click="acceptRepair(it.repair)">✅ 经理验收</button>
+                  <span v-if="it.repair.status === 'done'" class="cl-done">工单已验收结案，自有艇恢复参赛资格</span>
+                </div>
+                <div v-if="it.repair.status === 'repairing' || it.repair.status === 'repaired'" class="cl-warn">
+                  🚫 验收结案前自有艇停场检修、禁止参赛（可改用租赁艇出赛）
+                </div>
+              </div>
+              <!-- 开具工单入口：自有艇事故 + 已定损/已赔付/已拒付 + 尚未开工单（服务端 elig.canRepair 判定） -->
+              <div v-else-if="it.elig?.canRepair" class="rp-open">
+                <select class="rp-mech" :value="mechPick[it.raceId] ?? ''" :disabled="busyRepair === it.id"
+                  @change="mechPick[it.raceId] = $event.target.value">
+                  <option value="">自动 · 最强技工</option>
+                  <option v-for="m in mechanics" :key="m.id" :value="m.id">{{ m.name }}（技能{{ m.skill }}）</option>
+                </select>
+                <button class="btn sm primary" :disabled="busyRepair === it.id || store.team.money < (it.assessed || it.damage * 25)"
+                  @click="openRepair(it)">🧾 开具维修工单 ¥{{ (it.assessed || it.damage * 25).toLocaleString() }}</button>
+              </div>
+              <div v-else-if="it.elig?.repairReason && ['assessed', 'paid', 'rejected'].includes(it.status)" class="cl-warn">
+                🛟 {{ it.elig.repairReason }}
               </div>
             </div>
           </div>

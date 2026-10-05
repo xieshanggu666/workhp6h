@@ -91,9 +91,20 @@ const lineupNext = computed(() => {
               <b class="mono">{{ p.v }}</b>
             </div>
           </div>
-          <button class="btn mint w-full" :disabled="!!store.airship.rental" @click="store.maintain()">
-            {{ store.airship.rental ? '🛟 租约艇由出租方整备' : '🔧 维护部件' }}
+          <button class="btn mint w-full" :disabled="!!store.airship.rental || !!store.pendingRepair" @click="store.maintain()">
+            {{ store.airship.rental ? '🛟 租约艇由出租方整备' : store.pendingRepair ? '🧾 工单未结案，事故维修走工单流程' : '🔧 维护部件' }}
           </button>
+          <!-- 事故维修工单停场提示：未验收结案前自有艇禁止参赛、常规维护关闭 -->
+          <div v-if="store.pendingRepair" class="rp-banner">
+            <span>
+              🛠️ 事故维修工单 #{{ store.pendingRepair.id }} {{ store.pendingRepair.status === 'repaired' ? '待验收' : '维修中' }}
+              （技工 {{ store.pendingRepair.mechanic?.name || '—' }}）——验收结案前自有艇停场，禁止参赛
+            </span>
+            <div class="rp-actions">
+              <button v-if="store.pendingRepair.status === 'repairing'" class="btn sm primary" @click="store.completeRepair(store.pendingRepair.id)">⚒️ 技工完工</button>
+              <button v-else class="btn sm mint" @click="store.acceptRepair(store.pendingRepair.id)">✅ 经理验收</button>
+            </div>
+          </div>
         </div>
 
         <!-- 赛事排班：安排下一站出赛的机师/技工/飞艇，开赛瞬间快照进比赛记录 -->
