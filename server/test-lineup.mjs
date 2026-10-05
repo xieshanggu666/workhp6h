@@ -34,6 +34,17 @@ async function waitReady(port) {
   }
   throw new Error('server not ready')
 }
+// 结算后代玩家完成自有艇事故维修工单（未结案会阻断下一站开赛）；返回原结算响应
+async function settle(port, raceId) {
+  const st = await post(port, `/api/races/${raceId}/settle`, {})
+  if (st.ok && st.repair) {
+    const mech = (await api(port, '/api/state')).mechanics[0]
+    await post(port, `/api/repairs/${st.repair.id}/assign`, { mechanicId: mech.id })
+    await post(port, `/api/repairs/${st.repair.id}/repair`, {})
+    await post(port, `/api/repairs/${st.repair.id}/accept`, {})
+  }
+  return st
+}
 
 async function scenario() {
   console.log('\n[排班] 解析 → 开赛快照 → 结算归属 → 租约/自有艇排班联动')
@@ -65,7 +76,7 @@ async function scenario() {
     const r1again = await api(PORT, `/api/races/${r1.race.id}`)
     eq('改排班后记录机师仍为快照', r1again.race.record.factors.pilot.id, autoPilot)
     const expAuto0 = expOf(s0, autoPilot), expOther0 = expOf(s0, otherPilot)
-    const st1 = await post(PORT, `/api/races/${r1.race.id}/settle`, {})
+    const st1 = await settle(PORT, r1.race.id)
     ok('第 1 站结算成功', st1.ok)
     const s1 = await api(PORT, '/api/state')
     const gain1 = r1.race.record.result.rank <= 4 ? 3 : 1
@@ -86,7 +97,7 @@ async function scenario() {
     eq('记录机师=排班机师', r2.race.record.factors.pilot.id, otherPilot)
     eq('记录技工=排班技工', r2.race.record.factors.mech.id, mech2)
     eq('记录排班快照含指定机师', r2.race.record.factors.lineup.pilotId, otherPilot)
-    const st2 = await post(PORT, `/api/races/${r2.race.id}/settle`, {})
+    const st2 = await settle(PORT, r2.race.id)
     ok('第 2 站结算成功', st2.ok)
     const s3 = await api(PORT, '/api/state')
     const gain2 = r2.race.record.result.rank <= 4 ? 3 : 1
@@ -114,7 +125,7 @@ async function scenario() {
     eq('记录排班快照=rental', r3.race.record.factors.lineup.shipMode, 'rental')
     const wear3 = r3.race.record.result.wear
     const dmg3 = r3.race.record.incident?.damage || 0
-    await post(PORT, `/api/races/${r3.race.id}/settle`, {})
+    await settle(PORT, r3.race.id)
     const s5 = await api(PORT, '/api/state')
     eq('租约场次计入', s5.rental.races_used, 1)
     eq('租约累计磨损计入（含事故损伤）', s5.rental.wear_total, wear3 + dmg3)
@@ -129,11 +140,11 @@ async function scenario() {
     const r4 = await post(PORT, '/api/races/start/4', {})
     ok('第 4 站开赛成功', r4.ok)
     eq('记录为自有艇出赛（无租约快照）', r4.race.record.factors.rental, null)
-    // 自有艇累计磨损 = 第 1、2 站（租约前）+ 第 4 站（排班自有艇）；第 3 站租约艇出赛不计。
-    // 事故损伤与正常磨损同口径归属出赛艇，一并计入
-    const recWear = r => r.race.record.result.wear + (r.race.record.incident?.damage || 0)
+    // 自有艇累计磨损只计各场正常磨损：自有艇事故已由 settle() 中代走完维修工单恢复
+    // （事故损伤由工单修复，正常磨损才留在艇上）；第 3 站租约艇出赛完全不计入自有艇。
+    const recWear = r => r.race.record.result.wear
     const ownWear = recWear(r1) + recWear(r2) + recWear(r4)
-    await post(PORT, `/api/races/${r4.race.id}/settle`, {})
+    await settle(PORT, r4.race.id)
     const s6 = await api(PORT, '/api/state')
     eq('自有艇按各场记录累计磨损（租约场不计，含事故）', s6.airship.parts_dur, 100 - ownWear)
     eq('租约场次未被消耗', s6.rental.races_used, 1)

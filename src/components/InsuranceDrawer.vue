@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { useSkyStore } from '@/store/sky'
 const store = useSkyStore()
-defineEmits(['close'])
+defineEmits(['close', 'repair'])
 
 const ins = computed(() => store.insurance)
 const policy = computed(() => ins.value.policy)
@@ -21,6 +21,14 @@ const STATUS_META = {
   paid: { text: '✔ 已赔付结案', cls: 'st-paid' },
   rejected: { text: '赛季结束 · 已拒付', cls: 'st-rejected' },
   void: { text: '记录已作废', cls: 'st-void' }
+}
+// 关联维修工单状态简表（自有艇事故）；租约艇事故由出租方整备，无工单
+const REPAIR_META = {
+  draft: { text: '🔧 维修待派工', cls: 'rp-draft' },
+  assigned: { text: '🔧 技工维修中', cls: 'rp-assigned' },
+  repaired: { text: '🔧 维修待验收', cls: 'rp-repaired' },
+  accepted: { text: '✔ 维修已结案', cls: 'rp-accepted' },
+  void: { text: '维修单已作废', cls: 'rp-void' }
 }
 const covPct = v => Math.round(v * 100)
 
@@ -150,6 +158,12 @@ async function payout(it) {
                 </span>
                 <span class="tag o">损伤 {{ it.damage }} 点</span>
                 <span v-if="it.repLoss" class="tag rose">声望 −{{ it.repLoss }}</span>
+                <button v-if="it.repair && it.repair.status !== 'accepted' && it.repair.status !== 'void'"
+                  class="rp-jump" :class="REPAIR_META[it.repair.status]?.cls"
+                  @click="$emit('repair')">
+                  {{ REPAIR_META[it.repair.status]?.text || '维修工单' }} · 未结案禁赛 →
+                </button>
+                <span v-else-if="it.repair" class="tag m">✔ 维修已结案</span>
               </div>
 
               <!-- 定损 / 赔付明细 -->
@@ -179,7 +193,13 @@ async function payout(it) {
                 <button v-if="it.status === 'assessed'" class="btn sm"
                   :class="it.elig?.canPayout ? 'mint' : 'ghost'"
                   :disabled="busyId === it.id || !it.elig?.canPayout" @click="payout(it)">💰 申请赔付</button>
-                <span v-if="it.status === 'paid'" class="cl-done">赔款已到账，可在机库维修恢复部件</span>
+                <span v-if="it.status === 'paid'" class="cl-done">
+                  赔款已到账
+                  <button v-if="it.repair && it.repair.status !== 'accepted' && it.repair.status !== 'void'" class="rp-jump sm" @click="$emit('repair')">
+                    → 去维修工单（未结案禁赛）
+                  </button>
+                  <span v-else-if="it.ship.kind === 'own' && !it.repair" class="cl-done dim"> 可在机库维护恢复部件</span>
+                </span>
                 <span v-if="it.status === 'rejected'" class="cl-done dim">未在赛季结束前完成赔付，保险责任终止</span>
               </div>
             </div>

@@ -41,15 +41,27 @@ async function waitReady(port) {
   }
   throw new Error('server not ready')
 }
-async function playStation(port, cid) {
+async function playStation(port, cid, { autoRepair = true } = {}) {
   const started = await post(port, `/api/races/start/${cid}`, {})
   assert.ok(started.ok, `第 ${cid} 站开赛失败：${started.msg || ''}`)
   const settled = await post(port, `/api/races/${started.race.id}/settle`, {})
   assert.ok(settled.ok, `第 ${cid} 站结算失败：${settled.msg || ''}`)
+  // 新规则：自有艇事故维修工单未结案会阻断下一站开赛。保险测试关注理赔链路，
+  // 这里代玩家把工单走完（派工 → 维修 → 验收），租约艇事故无工单不受影响；
+  // autoRepair=false 供需要在结算后立即核对部件损伤的场景（事故损伤刚施加、工单尚 draft）
+  if (autoRepair && settled.repair) {
+    const mech = (await api(port, '/api/state')).mechanics[0]
+    const a = await post(port, `/api/repairs/${settled.repair.id}/assign`, { mechanicId: mech.id })
+    assert.ok(a.ok, '工单派工失败：' + (a.msg || ''))
+    const r = await post(port, `/api/repairs/${settled.repair.id}/repair`, {})
+    assert.ok(r.ok, '工单维修失败：' + (r.msg || ''))
+    const ac = await post(port, `/api/repairs/${settled.repair.id}/accept`, {})
+    assert.ok(ac.ok, '工单验收失败：' + (ac.msg || ''))
+  }
   return { started, settled }
 }
 // 反复重置赛季直到同一季出现 n 起事故（事故在开赛瞬间确定性生成，概率事件）
-async function playUntilIncidents(port, n, { stations = 6, rent = false, plan = 3 } = {}) {
+async function playUntilIncidents(port, n, { stations = 6, rent = false, plan = 3, autoRepair = true } = {}) {
   for (let attempt = 0; attempt < 80; attempt++) {
     await post(port, '/api/reset')
     if (plan) {
@@ -63,7 +75,7 @@ async function playUntilIncidents(port, n, { stations = 6, rent = false, plan = 
     const races = []
     const hits = []
     for (let cid = 1; cid <= stations; cid++) {
-      const r = await playStation(port, cid)
+      const r = await playStation(port, cid, { autoRepair })
       races.push(r)
       if (r.settled.incident) hits.push(r)
       if (hits.length >= n) return { hits, races, attempt }
@@ -208,7 +220,8 @@ async function main() {
 
     console.log('\n[事故影响] 部件健康与声望按等级扣减，可维修恢复')
     // 重置到「有事故 + 自有艇 + 有赔付能力」的一轮，只结算第 1 站后直接核对
-    const r4 = await playUntilIncident(PORT, { plan: 3, stations: 1 })
+    // （autoRepair=false：工单仍为 draft，事故损伤刚施加尚未修复）
+    const r4 = await playUntilIncident(PORT, { plan: 3, stations: 1, autoRepair: false })
     const snap4 = r4.race.started.race.record.incident
     const s4 = await api(PORT, '/api/state')
     const expectPd = Math.max(5, 100 - r4.race.started.race.record.result.wear - snap4.damage)
@@ -219,12 +232,25 @@ async function main() {
     const raceRepGain = r4.race.started.race.record.result.repGain
     const earnedContracts = s4.contracts.filter(c => c.earned).reduce((a, c) => a + c.rep, 0)
     eq('严重/坠毁事故扣声望（轻微不扣）', repAfter, 50 + raceRepGain + earnedContracts - repLoss)
-    // 走理赔后维护可恢复：先报案定损赔付，再维护回 100
+    // 新规则：事故未结案时常规维护被阻断，必须走维修工单（派工→维修→验收）恢复部件
+    const maintBlocked = await post(PORT, '/api/maintain', {})
+    ok('事故工单未结案时常规维护被阻断', !maintBlocked.ok)
+    // 走理赔后通过维修工单恢复：先报案定损赔付，再完工验收，部件恢复事故损伤部分
     const rp = await post(PORT, `/api/incidents/${r4.race.started.race.id}/report`, {})
     await post(PORT, `/api/incidents/${rp.incident.id}/assess`, {})
     await post(PORT, `/api/incidents/${rp.incident.id}/payout`, {})
+    const wo = s4.repairs.orders[0]
+    const mech4 = s4.mechanics[0]
+    const asg = await post(PORT, `/api/repairs/${wo.id}/assign`, { mechanicId: mech4.id })
+    ok('工单派工成功', asg.ok)
+    const repDone = await post(PORT, `/api/repairs/${wo.id}/repair`, {})
+    ok('工单维修成功（扣维修费、恢复事故损伤）', repDone.ok)
+    const s4mid = await api(PORT, '/api/state')
+    eq('维修后部件恢复事故损伤（正常磨损仍在）', s4mid.airship.parts_dur, Math.min(100, expectPd + snap4.damage))
+    await post(PORT, `/api/repairs/${wo.id}/accept`, {})
+    // 工单结案后常规维护恢复可用，可把剩余正常磨损补满到 100
     const maint = await post(PORT, '/api/maintain', {})
-    ok('事故后维护成功', maint.ok)
+    ok('工单结案后常规维护成功', maint.ok)
     const s4b = await api(PORT, '/api/state')
     eq('维护后部件恢复 100', s4b.airship.parts_dur, 100)
 

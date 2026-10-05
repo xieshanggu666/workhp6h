@@ -180,6 +180,33 @@ CREATE TABLE IF NOT EXISTS incidents (
   paid_at TEXT,
   rejected_at TEXT
 );
+-- 事故维修工单（经理 / 技工 / 保险方协同）：自有艇发生事故并随比赛结算后自动立案
+-- （租约艇由出租方整备、保险赔付对冲押金，不建本单）。全链路幂等：
+--   draft 待派工（经理指派技工并核定工单费）→ assigned 已派单·待维修
+--   → repaired 技工已完工·待验收（费用已扣、部件健康已恢复，仍禁止参赛）
+--   → accepted 经理与保险方验收通过、工单关闭（解除禁赛）
+--   → void 随越站历史修复对称作废（已完工的退维修费、回退技工心情）
+-- 一场事故至多一张工单（race_id 唯一）；未验收结案前该自有艇禁止参赛、禁止常规维护。
+CREATE TABLE IF NOT EXISTS repair_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  race_id INTEGER NOT NULL UNIQUE,
+  incident_id INTEGER,                  -- 关联物理理赔单（未报案事故为 NULL）
+  season INTEGER NOT NULL,
+  circuit_id INTEGER NOT NULL,
+  level TEXT NOT NULL,                  -- minor | major | crash（随事故快照）
+  cause TEXT NOT NULL DEFAULT '',       -- 事故情形（随事故快照，派工/验收展示用）
+  damage INTEGER NOT NULL DEFAULT 0,    -- 事故损伤点数（完工时按此恢复部件健康）
+  mechanic_id INTEGER,                  -- 派单技工（NULL = 尚未派工）
+  mechanic_name TEXT,                   -- 技工姓名快照
+  rate REAL,                            -- 技工技能折让后的每点维修费（派工时核定快照）
+  fee INTEGER NOT NULL DEFAULT 0,       -- 工单维修费（完工时扣款）
+  status TEXT NOT NULL DEFAULT 'draft', -- draft | assigned | repaired | accepted | void
+  created_at TEXT,
+  assigned_at TEXT,
+  repaired_at TEXT,
+  accepted_at TEXT,
+  voided_at TEXT
+);
 -- 比赛记录：动画 / 实时排名 / 最终奖励共用的唯一事实来源
 -- status=running 未完赛（可中断续看）；settled=1 已结算（奖励只发一次，可历史回放）
 CREATE TABLE IF NOT EXISTS races (

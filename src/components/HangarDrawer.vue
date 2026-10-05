@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { useSkyStore } from '@/store/sky'
 const store = useSkyStore()
-const emit = defineEmits(['close'])
+const emit = defineEmits(['close', 'repair'])
 const slotIco = { '引擎': '🔩', '翼板': '🦅', '氮气': '💨', '龙骨': '⛓️', '护甲': '🛡️' }
 const statName = { speed: '速度', turn: '转向', acc: '加速', dur: '耐久' }
 const perfList = () => [
@@ -91,8 +91,11 @@ const lineupNext = computed(() => {
               <b class="mono">{{ p.v }}</b>
             </div>
           </div>
-          <button class="btn mint w-full" :disabled="!!store.airship.rental" @click="store.maintain()">
-            {{ store.airship.rental ? '🛟 租约艇由出租方整备' : '🔧 维护部件' }}
+          <button class="btn mint w-full" :disabled="!!store.airship.rental || store.repairs.blocked" @click="store.maintain()">
+            {{ store.airship.rental ? '🛟 租约艇由出租方整备' : store.repairs.blocked ? '🔧 有事故维修工单未结案，请先走工单维修' : '🔧 维护部件' }}
+          </button>
+          <button v-if="store.repairs.blocked && !store.airship.rental" class="btn sm ghost w-full" @click="emit('repair')">
+            🔧 前往事故维修工单（{{ store.repairs.openCount }} 张未结案 · 禁赛中）
           </button>
         </div>
 

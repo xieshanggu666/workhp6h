@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { useSkyStore } from '@/store/sky'
 const store = useSkyStore()
-const emit = defineEmits(['view'])
+const emit = defineEmits(['view', 'repair'])
 
 const wIco = { '晴': '🌤️', '风': '🌬️', '雨': '🌧️', '雾': '🌫️', '雷暴': '⛈️' }
 // 浮岛在航线图上的坐标（左下→右上一条上升的航线）
@@ -25,6 +25,13 @@ function isOpen(c) { return !c.finished && c.id === nextId.value }
 // 中断续看：未结算的比赛记录（开赛瞬间生成，奖励尚未落账）
 const active = computed(() => store.activeRace)
 const activeCid = computed(() => active.value?.record?.circuit?.id ?? null)
+// 事故维修工单：存在未结案工单时，自有艇被阻断参赛（租约艇出赛不受影响）
+const repairBlocked = computed(() => {
+  const rp = store.repairs
+  if (!rp?.blocked) return false
+  // 排班解析为租约艇（有在履租约且模式非 own）时不禁赛
+  return !(store.lineup?.resolved?.ship?.kind === 'rental')
+})
 // 本战排班（下一站实际出赛阵容，服务端解析结果）
 const lineupTxt = computed(() => {
   const r = store.lineup?.resolved
@@ -165,6 +172,15 @@ function resume() { if (active.value) emit('view', active.value, 'live') }
       <button v-if="active" class="resume-hud" @click="resume">
         <span class="rh-dot"></span>
         「{{ active.record.circuit.name }}」比赛进行中 · 点击中断续看
+        <b>▶</b>
+      </button>
+    </transition>
+
+    <!-- 未修禁赛浮条：自有艇有未结案事故维修工单，完成维修验收前不能开赛 -->
+    <transition name="pop">
+      <button v-if="repairBlocked && !active" class="repair-block-hud" @click="emit('repair')">
+        <span>🔧</span>
+        自有艇有 {{ store.repairs.openCount }} 张事故维修工单未结案，<b>未修复不得参赛</b> · 点击前往派工维修验收
         <b>▶</b>
       </button>
     </transition>

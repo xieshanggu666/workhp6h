@@ -572,3 +572,50 @@ tbody tr:hover { background: rgba(255,255,255,.04); }
 
 /* 历史战绩事故标记 */
 .rincident { font-style: normal; font-size: 11px; color: var(--rose); margin-left: 4px; font-weight: 700; }
+
+/* ================= 事故维修工单 ================= */
+.fab { position: relative; }
+.fab-badge {
+  position: absolute; top: -4px; right: -4px; min-width: 17px; height: 17px; padding: 0 4px;
+  border-radius: 9px; background: linear-gradient(135deg, #ff5a6e, var(--rose)); color: #fff;
+  font-size: 10px; font-style: normal; font-weight: 800; display: grid; place-items: center;
+  box-shadow: 0 0 0 2px rgba(23,26,63,.9); animation: rhBlink 1.6s infinite;
+}
+.repair-block-hud {
+  position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 6;
+  display: flex; align-items: center; gap: 10px; padding: 11px 20px; border-radius: 30px;
+  background: linear-gradient(135deg, rgba(255,90,110,.96), rgba(255,159,176,.96)); color: #3a0a14;
+  font-weight: 700; font-size: 13px; border: none; box-shadow: 0 12px 34px rgba(0,0,0,.4), 0 0 0 2px rgba(255,255,255,.25);
+}
+.repair-block-hud b { font-weight: 900; }
+
+.rp-block-hud {
+  font-size: 12px; line-height: 1.55; color: var(--rose); background: rgba(255,159,176,.1);
+  border: 1px solid rgba(255,159,176,.4); border-radius: 12px; padding: 10px 12px;
+}
+.rp-block-hud b { color: var(--rose); }
+.rp-list { display: flex; flex-direction: column; gap: 12px; }
+.rp-card {
+  border-radius: var(--radius); padding: 14px 15px; background: var(--glass);
+  border: 1px solid var(--line); border-left: 3px solid var(--gold2);
+}
+.rp-card.st-repaired { border-left-color: var(--sky); }
+.rp-card.st-accepted { border-left-color: var(--mint); }
+.rp-card.st-void { border-left-color: var(--muted); opacity: .75; }
+.rp-status { margin-left: auto; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 20px; white-space: nowrap; }
+.rp-status.rp-draft { background: rgba(255,184,92,.2); color: var(--gold2); }
+.rp-status.rp-assigned { background: rgba(177,156,255,.2); color: #b19cff; }
+.rp-status.rp-repaired { background: rgba(126,203,255,.2); color: var(--sky); }
+.rp-status.rp-accepted { background: rgba(111,231,208,.18); color: var(--mint); }
+.rp-status.rp-void { background: rgba(169,179,216,.12); color: var(--muted); }
+.rp-assign { display: flex; align-items: center; gap: 10px; margin: 8px 0 6px; }
+.rp-assign select { flex: 1; min-width: 0; }
+.rp-role { font-size: 12px; color: var(--gold2); font-weight: 700; white-space: nowrap; }
+.rp-accept-hint { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+.io-stat.alert b { color: var(--rose); }
+.rp-jump {
+  border: 1px solid rgba(255,184,92,.5); background: rgba(255,184,92,.12); color: var(--gold2);
+  border-radius: 20px; padding: 3px 10px; font-size: 11px; font-weight: 700;
+}
+.rp-jump:hover { filter: brightness(1.15); }
+.rp-jump.sm { margin-left: 8px; padding: 2px 9px; font-size: 11px; }

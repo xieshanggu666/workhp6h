@@ -44,6 +44,13 @@ async function playStation(port, cid) {
   assert.ok(started.ok, `第 ${cid} 站开赛失败：${started.msg || ''}`)
   const settled = await post(port, `/api/races/${started.race.id}/settle`, {})
   assert.ok(settled.ok, `第 ${cid} 站结算失败：${settled.msg || ''}`)
+  // 自有艇事故维修工单未结案会阻断下一站开赛：代玩家走完派工→维修→验收（租约艇无工单）
+  if (settled.repair) {
+    const mech = (await api(port, '/api/state')).mechanics[0]
+    await post(port, `/api/repairs/${settled.repair.id}/assign`, { mechanicId: mech.id })
+    await post(port, `/api/repairs/${settled.repair.id}/repair`, {})
+    await post(port, `/api/repairs/${settled.repair.id}/accept`, {})
+  }
   return { started, settled }
 }
 
@@ -71,10 +78,12 @@ async function scenario() {
     const st1 = await playStation(PORT, 1)
     const rentalWear = st1.started.race.record.result.wear
     const ownWears = []
+    const ownRaceInc = []
     await post(PORT, '/api/lineup', { shipMode: 'own' }) // 雨燕剩 1 场留着跨赛季
     for (let cid = 2; cid <= 6; cid++) {
       const r = await playStation(PORT, cid)
       ownWears.push(r.started.race.record.result.wear)
+      ownRaceInc.push(r.started.race.record.incident?.damage || 0)
     }
     const sFull = await api(PORT, '/api/state')
     eq('6 站后 seasonComplete=true', sFull.seasonComplete, true)
@@ -136,15 +145,27 @@ async function scenario() {
     const incDamageRental = s1Recs
       .filter(rec => !!rec.factors?.rental)
       .reduce((a, rec) => a + (rec.incident?.damage || 0), 0)
-    // 第 1 季资金 = 初始 -（押金+租金）+ 各站奖金 + 当场兑现合约奖励；衔接后数额原封不动
+    // 第 1 季资金 = 初始 -（押金+租金）+ 各站奖金 + 当场兑现合约奖励 - 事故维修工单费；衔接后数额原封不动
     const earnedInS1 = sFull.contracts.filter(c => c.earned).reduce((a, c) => a + c.reward, 0)
-    const expectedMoney = money0 - (2400 + 600) + prize1 + earnedInS1
+    const repairFeesS1 = (sFull.repairs?.orders || [])
+      .filter(o => o.status === 'accepted' && o.season === 1)
+      .reduce((a, o) => a + (o.fee || 0), 0)
+    const expectedMoney = money0 - (2400 + 600) + prize1 + earnedInS1 - repairFeesS1
     eq('资金跨赛季保留（含第 1 季合约兑现）', Math.round(s2.team.money), Math.round(expectedMoney))
     const repGain1 = sFull.seasons.find(x => x.season === 1).rep
     const repContracts = sFull.contracts.filter(c => c.earned).reduce((a, c) => a + c.rep, 0)
     eq('声望跨赛季保留（含事故扣减）', s2.team.rep, rep0 + repGain1 + repContracts - incRepLoss)
     const ownWearTotal = ownWears.reduce((a, w) => a + w, 0)
-    eq('自有艇磨损跨赛季保留（第 2-6 站累计，含事故损伤）', s2.airship.parts_dur, Math.max(5, ownPd0 - ownWearTotal - incDamageOwn))
+    // 自有艇事故已随各站维修工单修复（事故损伤恢复，工单费已计入上面的资金口径），
+    // 跨赛季保留的部件磨损只剩各场正常磨损；但结算先施加「正常磨损+事故损伤」（部件地板 5）、
+    // 维修再恢复事故损伤（100 封顶），地板会改变净效果，故按记录逐站模拟同口径
+    const ownRecs = ownWears.map((w, i) => ({ wear: w, dmg: ownRaceInc[i] || 0 }))
+    let pdSim = ownPd0
+    for (const { wear, dmg } of ownRecs) {
+      const afterSettle = Math.max(5, pdSim - wear - dmg)
+      pdSim = Math.min(100, afterSettle + dmg)
+    }
+    eq('自有艇磨损跨赛季保留（正常磨损逐站结算，事故损伤已由工单修复）', s2.airship.parts_dur, pdSim)
     const rt = s2.rental
     ok('在履租约跨赛季保留', !!rt && rt.status === 'active')
     eq('租约已用场次跨赛季保留（仍为 1）', rt.races_used, 1)

@@ -4,7 +4,7 @@ import { useSkyStore } from '@/store/sky'
 const store = useSkyStore()
 // race：服务器落库的比赛记录（动画 / 实时排名 / 最终奖励共用同一份）；mode: live=开赛/续看，replay=历史回放
 const props = defineProps({ race: { type: Object, required: true }, mode: { type: String, default: 'live' } })
-const emit = defineEmits(['back', 'claim'])
+const emit = defineEmits(['back', 'claim', 'repair'])
 
 const wIco = { '晴': '🌤️', '风': '🌬️', '雨': '🌧️', '雾': '🌫️', '雷暴': '⛈️' }
 const rec = computed(() => props.race.record)
@@ -20,6 +20,8 @@ const contractsPaid = ref([])
 const contractsRevoked = ref([])
 // 本场事故理赔单（结算响应携带；平安完赛为 null），结算卡据此展示事故损伤与「去理赔」
 const incident = ref(null)
+// 本场事故维修工单（仅自有艇事故；租约艇为 null），结算卡据此提示派工维修与禁赛
+const repair = ref(null)
 // 最后一站结算后：本季 6 站全部完赛，结算卡追加赛季总结与「进入新赛季」
 const seasonComplete = ref(false)
 const advancing = ref(false)
@@ -113,6 +115,7 @@ async function finish() {
     contractsPaid.value = r.contractsPaid || []
     contractsRevoked.value = r.contractsRevoked || []
     incident.value = r.incident || null
+    repair.value = r.repair || null
     seasonComplete.value = !!r.seasonComplete
     await store.refresh() // 拉齐积分/赛季榜，结算卡的赛季总结按最新滚动战绩渲染
     showSettle.value = true
@@ -288,6 +291,9 @@ onUnmounted(() => { if (raf) cancelAnimationFrame(raf) })
             </div>
             <button v-if="isLive && incident" class="btn ghost sm s-btn s-claim-btn" @click="emit('claim')">
               🛡️ 前往保险 · 报案定损赔付
+            </button>
+            <button v-if="isLive && repair" class="btn ghost sm s-btn s-claim-btn" style="color:var(--gold2);border-color:rgba(255,184,92,.5)" @click="emit('repair')">
+              🔧 事故维修工单 · 派工维修验收（未结案禁赛）
             </button>
           </template>
           <!-- 赛季合约在结算事务内一次性兑现（幂等，重放不重复发奖） -->

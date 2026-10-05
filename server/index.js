@@ -467,6 +467,24 @@ function reverseSettledRace(row, c) {
   const inc = g.rec?.incident || null
   const totalWear = g.wear + (inc?.damage || 0)
   const incRow = inc ? get('SELECT * FROM incidents WHERE race_id=?', row.id) : null
+  // 事故维修工单对称处理：
+  //  - 已完工（repaired/accepted，费用已扣、部件已恢复、技工心情已奖）：退维修费、回退技工心情，
+  //    且事故损伤已由维修恢复过——部件回滚只能补「正常磨损」部分（维修恢复随作废再扣回，
+  //    两者相抵），否则会把事故损伤重复恢复一次；
+  //  - 仅派工/未派工（draft/assigned）：部件从未恢复，随结算口径补回「正常磨损+事故损伤」。
+  // 租约艇无工单（出租方整备）。
+  let repairFeeBack = 0
+  const repOrder = inc ? get('SELECT * FROM repair_orders WHERE race_id=?', row.id) : null
+  const repairDone = repOrder && (repOrder.status === 'repaired' || repOrder.status === 'accepted')
+  if (repOrder && repOrder.status !== 'void') {
+    if (repairDone) {
+      repairFeeBack = repOrder.fee || 0
+      if (repOrder.mechanic_id) {
+        run('UPDATE mechanics SET mood=MAX(0,MIN(100,mood-?)) WHERE id=?', REPAIR_MECH_MOOD, repOrder.mechanic_id)
+      }
+    }
+    run("UPDATE repair_orders SET status='void', voided_at=? WHERE id=?", now(), repOrder.id)
+  }
   let refundAdd = 0
   let payoutBack = 0
   if (rt && rt.status === 'active') {
@@ -482,9 +500,13 @@ function reverseSettledRace(row, c) {
     run('UPDATE rentals SET parts_dur=MIN(100,parts_dur+?), wear_total=?, races_used=MAX(0,races_used-1), wear_fee=?, refund=? WHERE id=?',
       totalWear, wearTotal2, wearFee2, refund2, rt.id)
   } else if (!rt) {
-    // 自有艇出赛：恢复自有艇磨损（含事故损伤）
+    // 自有艇出赛：事故损伤已由维修工单恢复（repaired/accepted）时，部件只回滚正常磨损；
+    // 未维修（draft/assigned/无单）时按结算口径恢复「正常磨损+事故损伤」
     const a = airship()
-    run('UPDATE airships SET parts_dur=MIN(100,parts_dur+?), hp=MIN(100,hp+?) WHERE id=?', totalWear, totalWear, a.id)
+    const restoreWear = repairDone ? g.wear : totalWear
+    if (restoreWear > 0) {
+      run('UPDATE airships SET parts_dur=MIN(100,parts_dur+?), hp=MIN(100,hp+?) WHERE id=?', restoreWear, restoreWear, a.id)
+    }
   }
   // 租约记录缺失：无归属可回（数据已不在），保持与正向口径一致，不动任何部件与资金
   const pilotId = g.rec?.factors?.pilot?.id
@@ -510,14 +532,14 @@ function reverseSettledRace(row, c) {
     repIncidentBack = INCIDENT_LEVELS[inc.level]?.repLoss || 0
     run("UPDATE incidents SET status='void' WHERE id=?", incRow.id)
   }
-  return { ...g, refundAdd, payoutBack, repIncidentBack }
+  return { ...g, refundAdd, payoutBack, repIncidentBack, repairFeeBack }
 }
 function settleRace(id) {
   const row = getRaceRow(id)
   if (!row) return { ok: false, status: 404, msg: '比赛记录不存在' }
   if (row.status === 'void') return { ok: false, status: 409, msg: '该比赛已在历史修复中作废，不能再次结算' }
   // 幂等重放同样要告知前端「本季是否已 6 站完赛」（决定结算卡是否展示进入新赛季）
-  if (row.settled) return { ok: true, already: true, race: parseRace(row), contractsPaid: [], contractsRevoked: [], incident: incidentBrief(row.season, row.id), seasonComplete: isSeasonComplete(row.season) }
+  if (row.settled) return { ok: true, already: true, race: parseRace(row), contractsPaid: [], contractsRevoked: [], incident: incidentBrief(row.season, row.id), repair: repairOrderByRace(row.id), seasonComplete: isSeasonComplete(row.season) }
 
   const rec = JSON.parse(row.record)
   const c = get('SELECT * FROM circuits WHERE id=?', row.circuit_id)
@@ -576,17 +598,27 @@ function settleRace(id) {
         // 事故理赔单（status=reported）随结算一并落库：定损/赔付只能在这条行上推进，
         // 一场比赛至多一起（race_id 唯一）；平安完赛不落行，事后报案无据（接口 404）
         let incBrief = null
+        let repairBrief = null
         if (incidentSnap) {
-          run(`INSERT INTO incidents (race_id,season,circuit_id,level,cause,damage,status,created_at,reported_at)
+          const ir = run(`INSERT INTO incidents (race_id,season,circuit_id,level,cause,damage,status,created_at,reported_at)
             VALUES (?,?,?,?,?,?, 'reported', ?, ?)`,
             row.id, rec.season, row.circuit_id, incidentSnap.level, incidentSnap.cause, dmg, row.created_at || now(), now())
           incBrief = incidentBrief(rec.season, row.id)
+          // 事故维修工单：仅自有艇出赛立案（租约艇由出租方整备，保险赔付对冲押金磨损费）。
+          // 经理派工 → 技工维修（扣款+恢复部件健康）→ 经理/保险方验收结案，结案前禁赛
+          if (!rt) {
+            run(`INSERT INTO repair_orders (race_id,incident_id,season,circuit_id,level,cause,damage,status,created_at)
+              VALUES (?,?,?,?,?,?,?, 'draft', ?)`,
+              row.id, Number(ir.lastInsertRowid), rec.season, row.circuit_id,
+              incidentSnap.level, incidentSnap.cause, dmg, now())
+            repairBrief = repairOrderByRace(row.id)
+          }
         }
         const contractSettle = reconcileContracts(rec.season) // 同一事务内对账赛季合约（累计进度→一次性兑现）
         const settledRow = parseRace(getRaceRow(id))
         // 全部 6 站已结算（且尚未衔接新赛季）→ 结算卡展示赛季总结与「进入新赛季」
         const complete = orderedCircuits().every(x => x.finished)
-        result = { ok: true, already: false, race: settledRow, contractsPaid: contractSettle.paid, contractsRevoked: contractSettle.revoked, incident: incBrief, seasonComplete: complete }
+        result = { ok: true, already: false, race: settledRow, contractsPaid: contractSettle.paid, contractsRevoked: contractSettle.revoked, incident: incBrief, repair: repairBrief, seasonComplete: complete }
       }
     }
     db.exec('COMMIT')
@@ -855,6 +887,189 @@ function advanceSeason() {
  * 所有资金/声望改动都在调用方事务边界一次完成。
  */
 const OWN_REPAIR_RATE = 25  // 自有艇事故损伤的单位维修费用（与 /api/maintain 的 25/点同价）
+// 事故维修工单：技工技能越高，维修费折让越多（每点技能 -0.1/点损伤，上限 20% 折让）
+const REPAIR_MECH_RATE_K = 0.1
+const REPAIR_MECH_MAX_DISCOUNT = 0.2
+const REPAIR_MECH_MOOD = 4     // 技工完工后的心情奖励（越站作废对称回退）
+// 单张工单各状态的可执行动作（服务端判定，前端只渲染）
+const REPAIR_STATUS = {
+  draft: { label: '待派工', cls: 'rp-draft' },
+  assigned: { label: '技工维修中', cls: 'rp-assigned' },
+  repaired: { label: '待验收', cls: 'rp-repaired' },
+  accepted: { label: '已验收结案', cls: 'rp-accepted' },
+  void: { label: '已作废', cls: 'rp-void' }
+}
+// 技工派工后的实际维修单价与工单总费用（派工时锁定快照，完工时照单扣款）
+function repairQuote(mechanic, damage) {
+  const discount = Math.min(REPAIR_MECH_MAX_DISCOUNT, Math.max(0, (mechanic?.skill || 0)) * REPAIR_MECH_RATE_K / OWN_REPAIR_RATE)
+  const rate = Math.round(OWN_REPAIR_RATE * (1 - discount) * 100) / 100
+  return { rate, discount, fee: Math.round(rate * (damage || 0)) }
+}
+// 全部未结案（未验收）的自有艇维修工单：存在时该自有艇禁止参赛、禁止常规维护
+function openRepairOrders() {
+  return all("SELECT * FROM repair_orders WHERE status IN ('draft','assigned','repaired') ORDER BY id ASC")
+}
+function repairOrderRowByRace(raceId) {
+  return get('SELECT * FROM repair_orders WHERE race_id=?', Number(raceId))
+}
+// 工单对外视图：附带赛道/事故/理赔/技工信息与当前可执行动作（服务端判定）
+function repairOrderView(row) {
+  if (!row) return null
+  const race = getRaceRow(row.race_id)
+  let rec = null
+  try { rec = race ? JSON.parse(race.record) : null } catch (e) { rec = null }
+  const cir = get('SELECT name,weather,diff FROM circuits WHERE id=?', row.circuit_id)
+  const lv = INCIDENT_LEVELS[row.level]
+  const mech = row.mechanic_id ? get('SELECT id,name,skill FROM mechanics WHERE id=?', row.mechanic_id) : null
+  const incident = row.incident_id ? get('SELECT id,status,payout,assessed,claim_id FROM incidents WHERE id=?', row.incident_id) : null
+  const st = row.status
+  return {
+    id: row.id, raceId: row.race_id, incidentId: row.incident_id || null, season: row.season,
+    circuit: { id: row.circuit_id, name: cir?.name || rec?.circuit?.name || '', weather: cir?.weather || rec?.circuit?.weather || '', diff: cir?.diff ?? rec?.circuit?.diff ?? 0 },
+    rank: race?.rank ?? rec?.result?.rank ?? null,
+    level: row.level, levelLabel: lv?.label || row.level,
+    cause: row.cause, damage: row.damage,
+    mechanic: mech ? { id: mech.id, name: mech.name, skill: mech.skill } : null,
+    rate: row.rate || 0, fee: row.fee || 0,
+    status: st, statusLabel: REPAIR_STATUS[st]?.label || st,
+    claimStatus: incident?.status || null, payout: incident?.payout || 0, assessed: incident?.assessed || 0,
+    createdAt: row.created_at, assignedAt: row.assigned_at, repairedAt: row.repaired_at, acceptedAt: row.accepted_at,
+    elig: repairEligibility(row)
+  }
+}
+// 工单各阶段可执行动作：draft→派工（经理）；assigned→完工（技工，扣维修费、恢复部件健康）；
+// repaired→验收（经理+保险方，结案解除禁赛）；accepted/void 无动作
+function repairEligibility(row) {
+  const res = { canAssign: false, canRepair: false, canAccept: false, reason: '' }
+  if (row.status === 'draft') res.canAssign = true
+  else if (row.status === 'assigned') res.canRepair = true
+  else if (row.status === 'repaired') res.canAccept = true
+  return res
+}
+function repairOrderByRace(raceId) {
+  return repairOrderView(repairOrderRowByRace(raceId))
+}
+function repairsPayload() {
+  const rows = all("SELECT * FROM repair_orders WHERE status!='void' ORDER BY id DESC")
+  const open = rows.filter(r => r.status !== 'accepted')
+  return {
+    orders: rows.map(repairOrderView),
+    // 待办徽标：未结案工单数（航线图 / 机库据此提示「未修飞艇禁赛」）
+    openCount: open.length,
+    blocked: open.length > 0,
+    rate: OWN_REPAIR_RATE
+  }
+}
+/* ================= 事故维修工单：派工 → 维修 → 验收（三角色协同，全链路幂等） =================
+ * draft 待派工：经理从车队名册中指定技工，服务端按技工技能核定折让后锁定维修单价/总费用；
+ * assigned 待维修：技工完工——校验资金 → 扣维修费 → 按事故损伤恢复自有艇 parts_dur/hp
+ *   （恢复口径与结算施加口径完全对称，以 100 为上限）、技工心情奖励 → repaired；
+ * repaired 待验收：经理与保险方共同验收（保险方可核对理赔单定损/赔付口径）后结案 accepted，
+ *   此时才解除「未修飞艇禁赛」。越站历史修复按结算口径对称作废（已完工的退维修费、回退心情）。
+ * 每一步以 status 为唯一闸门（事务内二次校验），重复/并发请求幂等不重复扣款。
+ */
+// 经理派工：请求体只接受 mechanicId（必须在车队名册），费用完全服务端核定
+function assignRepair(orderId, mechanicId) {
+  const o = get('SELECT * FROM repair_orders WHERE id=?', orderId)
+  if (!o) return { status: 404, body: { ok: false, msg: '维修工单不存在' } }
+  if (o.status === 'void') return { status: 409, body: { ok: false, msg: '该工单已随比赛作废' } }
+  if (o.status === 'accepted') return { status: 200, body: { ok: true, already: true, order: repairOrderView(o) } }
+  const mech = get('SELECT * FROM mechanics WHERE id=?', Number(mechanicId))
+  if (!mech) return { status: 400, body: { ok: false, msg: '该技工不在车队名册中' } }
+  let result
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const cur = get('SELECT * FROM repair_orders WHERE id=?', o.id)
+    if (cur.status === 'accepted') {
+      result = { status: 200, body: { ok: true, already: true, order: repairOrderView(cur) } }
+    } else if (cur.status === 'repaired' || cur.status === 'assigned') {
+      // 已派工/已完工：派工不可改派（费用快照已锁定），幂等返回当前工单
+      result = { status: 409, body: { ok: false, msg: '该工单已派工，不能改派技工' } }
+    } else if (cur.status !== 'draft') {
+      result = { status: 409, body: { ok: false, msg: '当前工单状态不能派工' } }
+    } else {
+      const q = repairQuote(mech, cur.damage)
+      run('UPDATE repair_orders SET mechanic_id=?, mechanic_name=?, rate=?, fee=?, status=?, assigned_at=? WHERE id=?',
+        mech.id, mech.name, q.rate, q.fee, 'assigned', now(), cur.id)
+      result = { status: 200, body: { ok: true, order: repairOrderByRace(cur.race_id), msg: `已派工给 ${mech.name}，工单维修费 ¥${q.fee}` } }
+    }
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    console.error('[SKY] 维修派工失败', e)
+    result = { status: 500, body: { ok: false, msg: '派工失败，请重试' } }
+  }
+  return result
+}
+// 技工完工：扣维修费 + 恢复事故损伤的部件健康（以 100 为上限）+ 技工心情奖励
+function completeRepair(orderId) {
+  const o = get('SELECT * FROM repair_orders WHERE id=?', orderId)
+  if (!o) return { status: 404, body: { ok: false, msg: '维修工单不存在' } }
+  if (o.status === 'void') return { status: 409, body: { ok: false, msg: '该工单已随比赛作废' } }
+  if (o.status === 'accepted' || o.status === 'repaired') {
+    return { status: 200, body: { ok: true, already: true, order: repairOrderView(get('SELECT * FROM repair_orders WHERE id=?', o.id)) } }
+  }
+  if (o.status !== 'assigned') return { status: 409, body: { ok: false, msg: '请先由经理派工，技工才能开始维修' } }
+  let result
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const cur = get('SELECT * FROM repair_orders WHERE id=?', o.id)
+    if (cur.status === 'repaired' || cur.status === 'accepted') {
+      result = { status: 200, body: { ok: true, already: true, order: repairOrderView(cur) } }
+    } else if (cur.status !== 'assigned') {
+      result = { status: 409, body: { ok: false, msg: '请先由经理派工，技工才能开始维修' } }
+    } else {
+      const t = teamCore()
+      if (t.money < cur.fee) {
+        result = { status: 400, body: { ok: false, msg: '车队资金不足，无法支付工单维修费', fee: cur.fee } }
+      } else {
+        run('UPDATE team SET money=money-? WHERE id=1', cur.fee)
+        // 恢复口径与 settleRace 施加事故损伤完全对称（parts_dur 与 hp 同点数恢复，100 封顶）
+        const a = airship()
+        run('UPDATE airships SET parts_dur=MIN(100,parts_dur+?), hp=MIN(100,hp+?) WHERE id=?',
+          cur.damage, cur.damage, a.id)
+        if (cur.mechanic_id) {
+          run('UPDATE mechanics SET mood=MIN(100,mood+?) WHERE id=?', REPAIR_MECH_MOOD, cur.mechanic_id)
+        }
+        run("UPDATE repair_orders SET status='repaired', repaired_at=? WHERE id=?", now(), cur.id)
+        result = { status: 200, body: { ok: true, fee: cur.fee, order: repairOrderByRace(cur.race_id), msg: `维修完成，扣款 ¥${cur.fee}，等待经理与保险方验收` } }
+      }
+    }
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    console.error('[SKY] 维修完工失败', e)
+    result = { status: 500, body: { ok: false, msg: '维修失败，请重试' } }
+  }
+  return result
+}
+// 经理 + 保险方验收：核对修复情况与理赔口径后结案，解除自有艇禁赛
+function acceptRepair(orderId) {
+  const o = get('SELECT * FROM repair_orders WHERE id=?', orderId)
+  if (!o) return { status: 404, body: { ok: false, msg: '维修工单不存在' } }
+  if (o.status === 'void') return { status: 409, body: { ok: false, msg: '该工单已随比赛作废' } }
+  if (o.status === 'accepted') return { status: 200, body: { ok: true, already: true, order: repairOrderView(o) } }
+  if (o.status !== 'repaired') return { status: 409, body: { ok: false, msg: '技工尚未完工，不能验收' } }
+  let result
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const cur = get('SELECT * FROM repair_orders WHERE id=?', o.id)
+    if (cur.status === 'accepted') {
+      result = { status: 200, body: { ok: true, already: true, order: repairOrderView(cur) } }
+    } else if (cur.status !== 'repaired') {
+      result = { status: 409, body: { ok: false, msg: '技工尚未完工，不能验收' } }
+    } else {
+      run("UPDATE repair_orders SET status='accepted', accepted_at=? WHERE id=?", now(), cur.id)
+      result = { status: 200, body: { ok: true, order: repairOrderByRace(cur.race_id), msg: '验收通过，飞艇已恢复参赛资格' } }
+    }
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    console.error('[SKY] 维修验收失败', e)
+    result = { status: 500, body: { ok: false, msg: '验收失败，请重试' } }
+  }
+  return result
+}
 function currentPolicy(season = teamCore().season) {
   return get('SELECT * FROM insurance WHERE season=? ORDER BY id DESC LIMIT 1', season) || null
 }
@@ -873,6 +1088,29 @@ function migrateInsurance() {
     const quota = cfg ? cfg.quota : p.max_payout   // 配置已下线的老方案：按单次上限兜底
     const paid = get("SELECT COALESCE(SUM(payout),0) s FROM incidents WHERE claim_id=? AND status='paid'", p.id).s
     run('UPDATE insurance SET quota=?, paid_total=? WHERE id=?', quota, paid, p.id)
+  })
+}
+// 老库兼容：工单功能上线前「当前赛季」已结算的自有艇事故（未越站作废）补建 draft 维修工单，
+// 使「未修飞艇禁赛」口径对进行中的赛季立即生效；往季事故已随赛季归档（旧制下部件已可常规
+// 维护恢复），不跨季补阻断性工单；租约艇事故、void 比赛、已有工单的一律跳过。
+// 在越站历史修复之后执行（void 记录不会被补单）；函数幂等（race_id 唯一，重复执行不补第二张）。
+function migrateRepairOrders() {
+  const season = Number(teamCore().season) || 1
+  const rows = all(`SELECT r.* FROM races r
+      WHERE r.season=? AND r.status='settled' AND r.settled=1
+        AND EXISTS (SELECT 1 FROM incidents i WHERE i.race_id=r.id AND i.status!='void')
+        AND NOT EXISTS (SELECT 1 FROM repair_orders o WHERE o.race_id=r.id)
+      ORDER BY r.id ASC`, season)
+  rows.forEach(r => {
+    let rec = null
+    try { rec = JSON.parse(r.record) } catch (e) { rec = null }
+    if (!rec?.incident || rec.factors?.rental) return  // 仅自有艇事故建单
+    const inc = get('SELECT id FROM incidents WHERE race_id=? AND status!=?', r.id, 'void')
+    if (!inc) return
+    run(`INSERT INTO repair_orders (race_id,incident_id,season,circuit_id,level,cause,damage,status,created_at)
+      VALUES (?,?,?,?,?,?,?, 'draft', ?)`,
+      r.id, inc.id, r.season, r.circuit_id, rec.incident.level, rec.incident.cause,
+      rec.incident.damage, r.created_at || now())
   })
 }
 // 行时间 → epoch ms：新表 created_at 为数字串；老库/中文时间串兜底回退 0（按「不早于」失败处理）
@@ -897,6 +1135,11 @@ function incidentBrief(season, raceId) {
     ship: rentalSnap ? { kind: 'rental', name: rentalSnap.name } : { kind: 'own', name: airship().name },
     repairCost: row.repair_cost || 0, assessed: row.assessed || 0, payout: row.payout || 0,
     status: row.status, claimId: row.claim_id || null,
+    // 关联事故维修工单（自有艇事故有单；租约艇为 null）：保险抽屉据此跳转维修协同
+    repair: (() => {
+      const ro = get('SELECT id,status FROM repair_orders WHERE race_id=?', row.race_id)
+      return ro ? { id: ro.id, status: ro.status, statusLabel: REPAIR_STATUS[ro.status]?.label || ro.status } : null
+    })(),
     policyName: policy?.name || null,
     reportedAt: row.reported_at, assessedAt: row.assessed_at, paidAt: row.paid_at, rejectedAt: row.rejected_at
   }
@@ -985,6 +1228,10 @@ function insurancePayload(season = teamCore().season) {
       repLoss: lv?.repLoss || 0, cause: rec.incident.cause, damage: rec.incident.damage,
       ship: rec.factors?.rental ? { kind: 'rental', name: rec.factors.rental.name } : { kind: 'own', name: airship().name },
       repairCost: 0, assessed: 0, payout: 0, status: 'unfiled', claimId: null,
+      repair: (() => {
+        const ro = get('SELECT id,status FROM repair_orders WHERE race_id=?', race.id)
+        return ro ? { id: ro.id, status: ro.status, statusLabel: REPAIR_STATUS[ro.status]?.label || ro.status } : null
+      })(),
       reportedAt: null, assessedAt: null, paidAt: null, rejectedAt: null,
       elig: eligOf(race, null)
     })
@@ -1190,7 +1437,7 @@ function reconcileLegacySkips() {
 
   db.exec('BEGIN')
   try {
-    let ptsBack = 0, moneyBack = 0, repBack = 0, refundBack = 0, payoutBack = 0, repIncBack = 0, racesVoided = 0
+    let ptsBack = 0, moneyBack = 0, repBack = 0, refundBack = 0, payoutBack = 0, repIncBack = 0, repairFeeBack = 0, racesVoided = 0
     skipped.forEach(c => {
       // 已被 races 记录认领的流水 id：其数额随记录回滚，兜底循环里不得再统计，避免双重回滚
       const claimedLogIds = new Set()
@@ -1201,6 +1448,7 @@ function reconcileLegacySkips() {
           ptsBack += g.pts; moneyBack += g.money; repBack += g.repGain
           refundBack += g.refundAdd   // 已归还租约需补退的磨损费（回写租约行，由这里统一给钱）
           payoutBack += g.payoutBack // 已理赔结案需冲回的保险赔付金（保单同步恢复有效）
+          repairFeeBack += g.repairFeeBack // 已完工维修工单的维修费退款（部件已随磨损统一恢复）
           repIncBack += g.repIncidentBack // 事故声望扣减随作废恢复
           if (rw.id) all('SELECT id FROM race_log WHERE race_id=?', rw.id).forEach(l => claimedLogIds.add(l.id))
         }
@@ -1219,9 +1467,9 @@ function reconcileLegacySkips() {
       console.log(`[SKY] 历史修复：赛站《${c.name}》在前置赛站未完成时已完赛（名次 ${c.rank}），回滚战绩、奖励、磨损与人员经验`)
       run('UPDATE circuits SET finished=0, rank=NULL WHERE id=?', c.id)
     })
-    // 奖金/声望冲回，押金磨损费补退（refundBack）、保险理赔冲回（payoutBack）
-    // ——全部资金改动在同一边界一次完成
-    const netMoney = moneyBack + payoutBack - refundBack
+    // 奖金/声望冲回，押金磨损费补退（refundBack）、保险理赔冲回（payoutBack）、
+    // 已完工维修工单退款（repairFeeBack，退回车队）——全部资金改动在同一边界一次完成
+    const netMoney = moneyBack + payoutBack - refundBack - repairFeeBack
     const netRep = Math.max(0, repBack - repIncBack)
     if (ptsBack || netMoney || netRep) {
       run('UPDATE team SET season_pts=MAX(0,season_pts-?), money=money-?, rep=MAX(0,rep-?) WHERE id=1',
@@ -1250,6 +1498,8 @@ ensureLineup()
 // 老行需先补齐 quota/paid_total 口径才能正确冲回
 migrateInsurance()
 reconcileLegacySkips()
+// 老库事故维修工单补齐必须在越站修复之后：void 比赛不得补单，未修复的存量自有艇事故即时禁赛
+migrateRepairOrders()
 // 启动兜底：无越站可修（或老库/注入数据导致合约状态与战绩不一致）时，上面的修复不会跑对账；
 // 这里再幂等对账一次，使「已兑现」始终与本赛季已结算战绩一致（重复执行不产生二次发奖）
 db.exec('BEGIN')
@@ -1266,6 +1516,7 @@ const payload = () => {
   const circuits = orderedCircuits()
   const contracts = contractsPayload(t.season)
   const insurance = insurancePayload(t.season)
+  const repairs = repairsPayload()
   const log = all('SELECT * FROM race_log ORDER BY id DESC')
   const done = circuits.filter(c => c.finished).length
   // 中断续看：当前未结算的比赛（每场仅一场 running）；history 供历史回放
@@ -1275,6 +1526,8 @@ const payload = () => {
     team: t, airship: st, upgrades, pilots, mechanics, circuits, contracts, log,
     // 赛事保险：方案目录 + 当季保单 + 本季事故理赔单（含未报案）+ 事故/赔付统计
     insurance,
+    // 事故维修工单：派工/维修/验收协同，未结案工单阻断自有艇参赛与常规维护
+    repairs,
     shop: SHOP_ITEMS,
     // 赛事排班：原始排班 + 下一站实际出赛阵容（机师/技工/出赛艇）
     lineup: lineupPayload(),
@@ -1409,6 +1662,9 @@ app.post('/api/maintain', (req, res) => {
   // 排班出赛艇为租约艇时：租赁艇由出租方整备（磨损在归还时计费），自有艇封存，均不可自行维护；
   // 排班为自有艇出赛时（即便有在履租约），自有艇正常磨损，可随时维护
   if (resolveLineup().rental) return res.json({ ok: false, msg: '租约艇由出租方整备；如需维护自有艇，请先将排班出赛艇调整为自有艇' })
+  // 事故维修未结案时，事故损伤必须走「维修工单」由技工修复+验收（防止常规维护绕过未修禁赛）
+  const open = openRepairOrders()[0]
+  if (open) return res.json({ ok: false, msg: `自有艇有事故维修工单未结案（${REPAIR_STATUS[open.status]?.label || open.status}），请先完成工单维修与验收` })
   const t = teamCore(); const a = airship()
   const cost = Math.round((100 - a.parts_dur) * 25)
   if (cost < 200 || t.money < 200) return res.status(200).json({ ok: false, cost, msg: cost < 200 ? '部件状态良好，无需维护' : '资金不足' })
@@ -1519,6 +1775,15 @@ app.post('/api/races/start/:cid', (req, res) => {
   if (lu.rentalMissing) {
     return res.json({ ok: false, msg: '排班指定租赁艇出赛，但当前没有在履租约，请先在机库签约或调整排班' })
   }
+  // 维修联动：自有艇存在未验收结案的事故维修工单时禁止参赛（未修复不得再上赛道）。
+  // 租约艇出赛不受影响（事故损伤由出租方整备）；切换租赁艇排班可继续参赛
+  if (!lu.rental) {
+    const pending = openRepairOrders()[0]
+    if (pending) {
+      const cir = get('SELECT name FROM circuits WHERE id=?', pending.circuit_id)
+      return res.json({ ok: false, msg: `自有艇事故维修未结案（${cir?.name || ''} ${REPAIR_STATUS[pending.status]?.label || pending.status}），请先在「维修工单」完成维修与验收` })
+    }
+  }
   // 租约联动：排班出赛艇为租约艇且场次用尽时，须先在机库归还结算，才能继续参赛
   const rt = lu.rental
   if (rt && rt.races_used >= rt.max_races) {
@@ -1609,9 +1874,36 @@ app.post('/api/incidents/:id/payout', (req, res) => {
   return res.status(r.status).json(r.body)
 })
 
+/* ---------- 事故维修工单：经理派工 / 技工维修 / 经理+保险方验收（状态机 + 幂等） ---------- */
+
+// 工单视图：全部工单（含已结案）+ 未结案数（未结案时自有艇禁赛）
+app.get('/api/repairs', (_, res) => res.json({ ok: true, ...repairsPayload() }))
+
+// 经理派工：请求体只接受 mechanicId（车队在册技工）；维修单价/总费用由服务端按技工技能核定
+app.post('/api/repairs/:id/assign', (req, res) => {
+  const mid = req.body?.mechanicId
+  if (typeof mid !== 'number' || !Number.isInteger(mid) || mid <= 0) {
+    return res.status(400).json({ ok: false, msg: '请指定一名在册技工' })
+  }
+  const r = assignRepair(Number(req.params.id), mid)
+  return res.status(r.status).json(r.body)
+})
+
+// 技工完工：扣工单维修费、按事故损伤恢复部件健康、技工心情奖励；幂等不重复扣款
+app.post('/api/repairs/:id/repair', (req, res) => {
+  const r = completeRepair(Number(req.params.id))
+  return res.status(r.status).json(r.body)
+})
+
+// 经理 + 保险方验收：核对修复与理赔口径后结案，解除自有艇禁赛；幂等
+app.post('/api/repairs/:id/accept', (req, res) => {
+  const r = acceptRepair(Number(req.params.id))
+  return res.status(r.status).json(r.body)
+})
+
 // 重置（重置数据到初始种子）
 app.post('/api/reset', (_, res) => {
-  ['race_log', 'races', 'rentals', 'contracts', 'seasons', 'circuits', 'upgrades', 'mechanics', 'pilots', 'airships', 'team', 'lineup', 'insurance', 'incidents'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })
+  ['race_log', 'races', 'rentals', 'contracts', 'seasons', 'circuits', 'upgrades', 'mechanics', 'pilots', 'airships', 'team', 'lineup', 'insurance', 'incidents', 'repair_orders'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })
   try { run('DELETE FROM sqlite_sequence') } catch (e) {}
   seed()
   ensureLineup()
